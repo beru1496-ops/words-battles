@@ -3,6 +3,8 @@ import json
 import random
 import sys
 import os
+import math
+from sound_manager import SoundManager
 
 # --- Configuration & Constants ---
 SCREEN_WIDTH = 1280  # Landscape
@@ -207,6 +209,11 @@ class SaveManager:
                 "hp": 0,
                 "attack": 0,
                 "defense": 0
+            },
+            "volume": {
+                "bgm": 0.3,
+                "se": 0.6,
+                "voice": 0.8
             }
         }
         
@@ -254,6 +261,19 @@ class SaveManager:
         self.data = self._default_data()
         self.save_data()
         print("Progress reset!")
+    
+    def get_volume(self, channel):
+        """Get volume for channel (bgm/se/voice). Returns 0.0-1.0."""
+        if "volume" not in self.data:
+            self.data["volume"] = {"bgm": 0.3, "se": 0.6, "voice": 0.8}
+        return self.data["volume"].get(channel, 0.5)
+    
+    def set_volume(self, channel, value):
+        """Set volume for channel (bgm/se/voice). Value 0.0-1.0."""
+        if "volume" not in self.data:
+            self.data["volume"] = {"bgm": 0.3, "se": 0.6, "voice": 0.8}
+        self.data["volume"][channel] = max(0.0, min(1.0, value))
+        self.save_data()
 
 
 class DeckManager:
@@ -422,8 +442,9 @@ class Button:
 
 class ResultScreen:
     """Displays battle results and handles transition to next stage."""
-    def __init__(self, font_manager, mastered_cards, new_cards, stage, on_next_stage):
+    def __init__(self, font_manager, sound_manager, mastered_cards, new_cards, stage, on_next_stage):
         self.font_manager = font_manager
+        self.sound_manager = sound_manager
         self.mastered_cards = mastered_cards
         self.new_cards = new_cards
         self.stage = stage
@@ -497,8 +518,9 @@ class ResultScreen:
 
 class GameOverScreen:
     """Displays game over screen with restart option."""
-    def __init__(self, font_manager, stage, on_restart):
+    def __init__(self, font_manager, sound_manager, stage, on_restart):
         self.font_manager = font_manager
+        self.sound_manager = sound_manager
         self.stage = stage
         self.on_restart = on_restart
         
@@ -552,8 +574,9 @@ BONUS_LIST = [
 
 class BonusSelectScreen:
     """Roguelike bonus selection screen after every 3 stages."""
-    def __init__(self, font_manager, player, on_select_done):
+    def __init__(self, font_manager, sound_manager, player, on_select_done):
         self.font_manager = font_manager
+        self.sound_manager = sound_manager
         self.player = player
         self.on_select_done = on_select_done
         
@@ -635,13 +658,14 @@ class BonusSelectScreen:
 
 class Battle:
     """Handles a single battle session."""
-    def __init__(self, deck_manager, font_manager, stage, player, save_manager, on_battle_end, on_game_over):
+    def __init__(self, deck_manager, font_manager, stage, player, save_manager, sound_manager, on_battle_end, on_game_over):
         self.deck_manager = deck_manager
         self.font_manager = font_manager
         self.stage = stage
         self.on_battle_end = on_battle_end
         self.on_game_over = on_game_over
         self.save_manager = save_manager
+        self.sound_manager = sound_manager
         
         # Player object (persistent across stages)
         self.player = player
@@ -661,12 +685,20 @@ class Battle:
         self.state = "COUNTDOWN"
         self.countdown_timer = 3.0
         
+        # Switch to battle BGM
+        self.sound_manager.play_bgm("たったそれだけの物語.wav")
+        
         self.buttons = []
         self.input_box = None
         
         # Show answer state
         self.show_answer_timer = 0
         self.correct_answer_text = ""
+        
+        # Enemy attack state
+        self.enemy_attack_timer = 0
+        self.enemy_attack_damage = 0
+        self.screen_shake_offset = 0
         
         # Prepare hand
         self.deck_manager.hand = []
@@ -685,6 +717,11 @@ class Battle:
             return
             
         card = self.deck_manager.hand[self.active_card_index]
+        
+        # Play Voice (TTS) only during play (not countdown)
+        if self.state == "PLAYING":
+             self.sound_manager.play_voice(card.word)
+        
         center_x = self.main_area_center_x
         
         if card.mode == "SELECTION":
@@ -737,7 +774,11 @@ class Battle:
         card.mastery += 1
         
         # Record mastery to save data
+        # Record mastery to save data
         self.save_manager.update_word_mastery(card.id)
+        
+        # Play SE
+        self.sound_manager.play_se("correct.mp3")
         
         self.enemy.take_damage(damage)
         self.message = f"Correct! ({damage} dmg)"
@@ -766,6 +807,9 @@ class Battle:
         self.show_answer_timer = 2.0  # Show for 2 seconds
         card.is_correct = False
         
+        # Play SE
+        self.sound_manager.play_se("wrong.mp3")
+        
         # Prepare correct answer text
         if card.mode == "SELECTION":
             self.correct_answer_text = f"正解: {card.meaning}"
@@ -779,18 +823,17 @@ class Battle:
         """Called when timer runs out - enemy attacks player."""
         base_damage = 20 + (self.stage * 5)  # Damage increases with stage
         actual_damage = self.player.take_damage(base_damage)
-        self.message = f"Ouch! Took {actual_damage} dmg!"
-        self.message_timer = 60
+        self.sound_manager.play_se("attack.mp3")
+        self.enemy_attack_damage = actual_damage
         
         if self.player.current_hp <= 0:
             self.state = "GAME_OVER"
             self.on_game_over()
         else:
-            # Reset hand and timer to continue
-            self.timer = self.player.get_effective_turn_time()
-            self.deck_manager.reload_hand()
-            self.active_card_index = 0
-            self.setup_ui_for_active_card()
+            # Transition to ENEMY_ATTACK state with delay
+            self.state = "ENEMY_ATTACK"
+            self.enemy_attack_timer = 1.5
+            self.screen_shake_offset = 10  # Start shake
 
     def update(self, dt):
         if self.state == "COUNTDOWN":
@@ -799,6 +842,11 @@ class Battle:
                 self.state = "PLAYING"
                 self.message = "START!"
                 self.message_timer = 30
+                
+                # Play voice for the first card
+                if self.deck_manager.hand and self.active_card_index < len(self.deck_manager.hand):
+                     card = self.deck_manager.hand[self.active_card_index]
+                     self.sound_manager.play_voice(card.word)
 
         if self.state == "PLAYING":
             self.timer -= dt
@@ -828,6 +876,23 @@ class Battle:
                     self.active_card_index = 0
                 self.setup_ui_for_active_card()
                 self.state = "PLAYING"
+        
+        # Handle ENEMY_ATTACK state (damage delay)
+        if self.state == "ENEMY_ATTACK":
+            self.enemy_attack_timer -= dt
+            # Decay screen shake
+            self.screen_shake_offset = max(0, self.screen_shake_offset - dt * 15)
+            if self.enemy_attack_timer <= 0:
+                # Resume: reload hand and continue
+                self.timer = self.player.get_effective_turn_time()
+                self.deck_manager.reload_hand()
+                self.active_card_index = 0
+                self.setup_ui_for_active_card()
+                self.state = "PLAYING"
+                # Play voice for new card
+                if self.deck_manager.hand and self.active_card_index < len(self.deck_manager.hand):
+                    card = self.deck_manager.hand[self.active_card_index]
+                    self.sound_manager.play_voice(card.word)
 
     def handle_event(self, event):
         if self.state == "PLAYING":
@@ -954,15 +1019,41 @@ class Battle:
             overlay.fill((0, 0, 0, 100))
             screen.blit(overlay, (0,0))
             screen.blit(c_surf, c_rect)
-
-            screen.blit(c_surf, c_rect)
+        
+        # Enemy Attack Overlay
+        if self.state == "ENEMY_ATTACK":
+            # Red flash overlay (fades out as timer decreases)
+            flash_alpha = int(min(200, 200 * (self.enemy_attack_timer / 1.5)))
+            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((200, 0, 0, flash_alpha))
+            screen.blit(overlay, (0, 0))
+            
+            # Damage text
+            dmg_font = self.font_manager.get_font(72, 'english')
+            dmg_text = f"-{self.enemy_attack_damage} HP!"
+            dmg_surf = dmg_font.render(dmg_text, True, (255, 80, 80))
+            dmg_rect = dmg_surf.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2 - 40))
+            
+            # Apply screen shake
+            shake_x = int(math.sin(pygame.time.get_ticks() * 0.05) * self.screen_shake_offset)
+            shake_y = int(math.cos(pygame.time.get_ticks() * 0.07) * self.screen_shake_offset)
+            dmg_rect.x += shake_x
+            dmg_rect.y += shake_y
+            screen.blit(dmg_surf, dmg_rect)
+            
+            # "Ouch!" text
+            ouch_font = self.font_manager.get_font(36, 'english')
+            ouch_surf = ouch_font.render("Ouch!", True, (255, 200, 200))
+            ouch_rect = ouch_surf.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2 + 40))
+            screen.blit(ouch_surf, ouch_rect)
 
 
 class ShopScreen:
     """Shop screen for permanent upgrades using Rank Points."""
-    def __init__(self, font_manager, save_manager, on_back):
+    def __init__(self, font_manager, save_manager, sound_manager, on_back):
         self.font_manager = font_manager
         self.save_manager = save_manager
+        self.sound_manager = sound_manager
         self.on_back = on_back
         
         # Upgrade Buttons
@@ -1041,9 +1132,10 @@ class ShopScreen:
 
 
 class TitleScreen:
-    def __init__(self, font_manager, save_manager, on_start, on_word_list, on_shop, on_settings, on_exit):
+    def __init__(self, font_manager, save_manager, sound_manager, on_start, on_word_list, on_shop, on_settings, on_exit):
         self.font_manager = font_manager
         self.save_manager = save_manager
+        self.sound_manager = sound_manager
         self.buttons = []
         
         btn_w, btn_h = 360, 50
@@ -1056,6 +1148,9 @@ class TitleScreen:
         self.buttons.append(Button(pygame.Rect(center_x - btn_w//2, start_y + (btn_h+gap)*2, btn_w, btn_h), "Shop", font_manager.get_font(24, 'english'), on_shop, None))
         self.buttons.append(Button(pygame.Rect(center_x - btn_w//2, start_y + (btn_h+gap)*3, btn_w, btn_h), "Settings", font_manager.get_font(24, 'english'), on_settings, None))
         self.buttons.append(Button(pygame.Rect(center_x - btn_w//2, start_y + (btn_h+gap)*4, btn_w, btn_h), "Exit", font_manager.get_font(24, 'english'), on_exit, None))
+        
+        # Start BGM
+        self.sound_manager.play_bgm("Confront_-The_Fate-_Short.mp3")
 
     def handle_event(self, event):
         for btn in self.buttons:
@@ -1082,9 +1177,10 @@ class TitleScreen:
             btn.draw(screen)
 
 class WordListScreen:
-    def __init__(self, font_manager, save_manager, words_data, on_back):
+    def __init__(self, font_manager, save_manager, sound_manager, words_data, on_back):
         self.font_manager = font_manager
         self.save_manager = save_manager
+        self.sound_manager = sound_manager
         self.words_data = words_data
         self.back_button = Button(pygame.Rect(50, 50, 150, 50), "Back", font_manager.get_font(24, 'english'), on_back, None)
         
@@ -1219,34 +1315,94 @@ class WordListScreen:
         self.back_button.draw(screen)
 
 class SettingsScreen:
-    def __init__(self, font_manager, save_manager, on_back):
+    def __init__(self, font_manager, save_manager, sound_manager, on_back):
         self.font_manager = font_manager
         self.save_manager = save_manager
+        self.sound_manager = sound_manager
         self.back_button = Button(pygame.Rect(50, 50, 150, 50), "Back", font_manager.get_font(24, 'english'), on_back, None)
         
         # Reset Progress Button
         center_x = SCREEN_WIDTH // 2
         self.reset_button = Button(
-            pygame.Rect(center_x - 150, 400, 300, 60), 
+            pygame.Rect(center_x - 150, 580, 300, 60), 
             "Reset Progress", 
             font_manager.get_font(24, 'english'), 
             self._on_reset, 
             None
         )
         self.reset_confirmed = False
+        
+        # Volume Sliders
+        slider_x = center_x - 200
+        slider_w = 400
+        slider_h = 8
+        
+        # Load saved volumes and apply to SoundManager
+        bgm_vol = save_manager.get_volume("bgm")
+        se_vol = save_manager.get_volume("se")
+        voice_vol = save_manager.get_volume("voice")
+        
+        sound_manager.set_volume_bgm(bgm_vol)
+        sound_manager.set_volume_se(se_vol)
+        sound_manager.set_volume_voice(voice_vol)
+        
+        self.sliders = [
+            {"label": "BGM Volume",   "channel": "bgm",   "x": slider_x, "y": 250, "w": slider_w, "h": slider_h, "value": bgm_vol},
+            {"label": "SE Volume",    "channel": "se",    "x": slider_x, "y": 340, "w": slider_w, "h": slider_h, "value": se_vol},
+            {"label": "Voice Volume", "channel": "voice", "x": slider_x, "y": 430, "w": slider_w, "h": slider_h, "value": voice_vol},
+        ]
+        self.dragging_slider = None  # Index of slider being dragged
     
     def _on_reset(self, _):
         if not self.reset_confirmed:
-            # First click: ask for confirmation
             self.reset_confirmed = True
         else:
-            # Second click: actually reset
             self.save_manager.reset_data()
             self.reset_confirmed = False
+    
+    def _get_thumb_x(self, slider):
+        return slider["x"] + int(slider["value"] * slider["w"])
+    
+    def _apply_volume(self, slider):
+        """Apply volume change to SoundManager and save."""
+        ch = slider["channel"]
+        val = slider["value"]
+        if ch == "bgm":
+            self.sound_manager.set_volume_bgm(val)
+        elif ch == "se":
+            self.sound_manager.set_volume_se(val)
+        elif ch == "voice":
+            self.sound_manager.set_volume_voice(val)
+        self.save_manager.set_volume(ch, val)
     
     def handle_event(self, event):
         self.back_button.check_input(event)
         self.reset_button.check_input(event)
+        
+        thumb_radius = 14
+        
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            for i, s in enumerate(self.sliders):
+                tx = self._get_thumb_x(s)
+                # Check if click is on thumb or track
+                if abs(my - s["y"]) < 20 and s["x"] - 5 <= mx <= s["x"] + s["w"] + 5:
+                    self.dragging_slider = i
+                    # Snap to click position
+                    ratio = (mx - s["x"]) / s["w"]
+                    s["value"] = max(0.0, min(1.0, ratio))
+                    self._apply_volume(s)
+                    break
+        
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging_slider = None
+        
+        if event.type == pygame.MOUSEMOTION and self.dragging_slider is not None:
+            mx = event.pos[0]
+            s = self.sliders[self.dragging_slider]
+            ratio = (mx - s["x"]) / s["w"]
+            s["value"] = max(0.0, min(1.0, ratio))
+            self._apply_volume(s)
         
     def draw(self, screen):
         screen.fill(COLOR_BG)
@@ -1257,6 +1413,39 @@ class SettingsScreen:
         text = font.render("Settings", True, COLOR_TEXT_MAIN)
         screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 150))
         
+        # Volume Sliders
+        label_font = self.font_manager.get_font(24, 'english')
+        value_font = self.font_manager.get_font(20, 'english')
+        
+        for i, s in enumerate(self.sliders):
+            # Label
+            label_surf = label_font.render(s["label"], True, COLOR_TEXT_MAIN)
+            screen.blit(label_surf, (s["x"], s["y"] - 30))
+            
+            # Percentage
+            pct = int(s["value"] * 100)
+            pct_surf = value_font.render(f"{pct}%", True, (200, 200, 200))
+            screen.blit(pct_surf, (s["x"] + s["w"] + 15, s["y"] - 8))
+            
+            # Track background
+            track_rect = pygame.Rect(s["x"], s["y"] - s["h"]//2, s["w"], s["h"])
+            pygame.draw.rect(screen, (60, 60, 60), track_rect, border_radius=4)
+            
+            # Filled portion
+            fill_w = int(s["value"] * s["w"])
+            if fill_w > 0:
+                fill_rect = pygame.Rect(s["x"], s["y"] - s["h"]//2, fill_w, s["h"])
+                color = (80, 200, 120) if i == 0 else (100, 180, 255) if i == 1 else (255, 180, 80)
+                pygame.draw.rect(screen, color, fill_rect, border_radius=4)
+            
+            # Thumb
+            thumb_x = self._get_thumb_x(s)
+            is_dragging = (self.dragging_slider == i)
+            thumb_color = (255, 255, 255) if is_dragging else (200, 200, 200)
+            thumb_radius = 12 if is_dragging else 10
+            pygame.draw.circle(screen, thumb_color, (thumb_x, s["y"]), thumb_radius)
+            pygame.draw.circle(screen, (100, 100, 100), (thumb_x, s["y"]), thumb_radius, 2)
+        
         # Reset Button
         self.reset_button.draw(screen)
         
@@ -1264,7 +1453,7 @@ class SettingsScreen:
         if self.reset_confirmed:
             warn_font = self.font_manager.get_font(20, 'english')
             warn_text = warn_font.render("Click again to confirm reset!", True, (255, 100, 100))
-            screen.blit(warn_text, (SCREEN_WIDTH // 2 - warn_text.get_width() // 2, 480))
+            screen.blit(warn_text, (SCREEN_WIDTH // 2 - warn_text.get_width() // 2, 660))
 
 
 class Game:
@@ -1283,6 +1472,13 @@ class Game:
     def _init_game_state(self):
         """Initialize or reset game state."""
         self.save_manager = SaveManager()
+        self.sound_manager = SoundManager()
+        
+        # Apply saved volume settings
+        self.sound_manager.set_volume_bgm(self.save_manager.get_volume("bgm"))
+        self.sound_manager.set_volume_se(self.save_manager.get_volume("se"))
+        self.sound_manager.set_volume_voice(self.save_manager.get_volume("voice"))
+        
         self.deck_manager = DeckManager(self.words_data, self.font_manager, self.save_manager)
         
         self.stage = 1
@@ -1293,6 +1489,7 @@ class Game:
         self.title_screen = TitleScreen(
             self.font_manager, 
             self.save_manager,
+            self.sound_manager,
             self._on_start_game, 
             self._on_open_word_list,
             self._on_open_shop,
@@ -1313,19 +1510,22 @@ class Game:
 
     def _on_start_game(self, _):
         """Start a new game session."""
+        # Refresh player with latest permanent stats (including shop upgrades)
+        self.stage = 1
+        self.player = Player(self.save_manager.get_permanent_stats())
         self._start_battle()
 
     def _on_open_word_list(self, _):
         self.state = "WORD_LIST"
-        self.word_list_screen = WordListScreen(self.font_manager, self.save_manager, self.words_data, self._on_back_to_title)
+        self.word_list_screen = WordListScreen(self.font_manager, self.save_manager, self.sound_manager, self.words_data, self._on_back_to_title)
 
     def _on_open_shop(self, _):
         self.state = "SHOP"
-        self.shop_screen = ShopScreen(self.font_manager, self.save_manager, self._on_back_to_title)
+        self.shop_screen = ShopScreen(self.font_manager, self.save_manager, self.sound_manager, self._on_back_to_title)
 
     def _on_open_settings(self, _):
         self.state = "SETTINGS"
-        self.settings_screen = SettingsScreen(self.font_manager, self.save_manager, self._on_back_to_title)
+        self.settings_screen = SettingsScreen(self.font_manager, self.save_manager, self.sound_manager, self._on_back_to_title)
 
     def _on_exit_game(self, _):
         pygame.quit()
@@ -1337,6 +1537,7 @@ class Game:
         self.title_screen = TitleScreen(
             self.font_manager, 
             self.save_manager,
+            self.sound_manager,
             self._on_start_game, 
             self._on_open_word_list,
             self._on_open_shop,
@@ -1353,6 +1554,7 @@ class Game:
             self.stage,
             self.player,
             self.save_manager,
+            self.sound_manager,
             self._on_battle_end,
             self._on_game_over
         )
@@ -1381,6 +1583,7 @@ class Game:
         self.state = "RESULT"
         self.result_screen = ResultScreen(
             self.font_manager,
+            self.sound_manager,
             mastered,
             new_cards,
             self.stage,
@@ -1397,6 +1600,7 @@ class Game:
             self.state = "BONUS_SELECT"
             self.bonus_screen = BonusSelectScreen(
                 self.font_manager,
+                self.sound_manager,
                 self.player,
                 self._on_bonus_selected
             )
@@ -1413,6 +1617,7 @@ class Game:
         self.state = "GAME_OVER"
         self.game_over_screen = GameOverScreen(
             self.font_manager,
+            self.sound_manager,
             self.stage,
             self._on_restart
         )
@@ -1425,6 +1630,9 @@ class Game:
 
     def update(self):
         dt = self.clock.tick(FPS) / 1000.0
+        
+        # Update SoundManager
+        self.sound_manager.update()
         
         if self.state == "BATTLE" and self.battle:
             self.battle.update(dt)
